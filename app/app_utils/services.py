@@ -66,10 +66,11 @@ MEMORY_SERVICE_URI = "shared://memory"
 def get_memory_service():
     """Process-wide Vertex AI Memory Bank service."""
     from google.adk.memory import VertexAiMemoryBankService
+    agent_engine_id = os.environ.get("GOOGLE_CLOUD_AGENT_ENGINE_ID") or "5673354654998593536"
     return VertexAiMemoryBankService(
         project="qwiklabs-gcp-04-e954671c3d10",
-        location="us-east1",
-        agent_engine_id="2926440357279301632",
+        location=os.environ.get("GOOGLE_CLOUD_AGENT_ENGINE_LOCATION") or "us-east1",
+        agent_engine_id=agent_engine_id,
     )
 
 @functools.cache

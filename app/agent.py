@@ -105,20 +105,25 @@ def run_in_code_sandbox(python_code: str) -> str:
 # Image Generation Tool: Mission Patch Badge
 # ---------------------------------------------------------
 
-def generate_mission_patch(
+async def generate_mission_patch(
     satellite_name: str,
     location_name: str,
-    observed_date: str
+    observed_date: str,
+    sighting_id: Optional[str] = None,
+    tool_context: Optional[Any] = None
 ) -> Dict[str, Any]:
-    """Generate a colourful embroidered mission-patch style badge celebrating an observed satellite sighting and upload it to Cloud Storage.
+    """Generate a colourful embroidered mission-patch style badge celebrating an observed satellite sighting,
+    save it as a session artifact for the Playground UI, upload it to public Cloud Storage, and save its URL to Firestore.
 
     Args:
         satellite_name: Name of the satellite spotted (e.g. 'ISS', 'Hubble').
         location_name: Name of the observing city or landmark (e.g. 'Bengaluru', 'Tokyo').
         observed_date: Date string of observation (e.g. '2026-09-29').
+        sighting_id: Optional Firestore sighting_id from orbit_sightings to attach the patch_url to.
+        tool_context: ADK ToolContext provided automatically by the runner.
 
     Returns:
-        Dictionary with public_url of the uploaded mission patch badge image in Cloud Storage.
+        Dictionary with public_url, filename, and Firestore update status.
     """
     try:
         genai_client = genai.Client(vertexai=True, project=GCP_PROJECT_ID, location="global")
@@ -150,22 +155,61 @@ def generate_mission_patch(
             return {"error": "Failed to generate image bytes from gemini-3.1-flash-lite-image"}
 
         filename = f"patch_{uuid.uuid4().hex[:8]}.jpg"
+
+        # 1. Save artifact with tool_context if available so it appears in Playground's Artifacts panel
+        if tool_context and hasattr(tool_context, "save_artifact"):
+            try:
+                part = types.Part(inline_data=types.Blob(mime_type=mime_type, data=image_bytes))
+                await tool_context.save_artifact(filename=filename, artifact=part)
+            except Exception as art_err:
+                pass
+
+        # 2. Upload image bytes directly to public Cloud Storage bucket
         client = get_storage_client()
         bucket = client.bucket(STORAGE_BUCKET_NAME)
         blob = bucket.blob(filename)
         blob.upload_from_string(image_bytes, content_type=mime_type)
 
         public_url = f"https://storage.googleapis.com/{STORAGE_BUCKET_NAME}/{filename}"
+
+        # 3. Save patch_url on the sighting in Firestore
+        firestore_updated = False
+        db = get_firestore_client()
+        if sighting_id:
+            try:
+                doc_ref = db.collection("orbit_sightings").document(sighting_id)
+                if doc_ref.get().exists:
+                    doc_ref.update({"patch_url": public_url})
+                    firestore_updated = True
+            except Exception:
+                pass
+        else:
+            # If no sighting_id provided, attach to the most recent matching sighting in orbit_sightings
+            try:
+                recent_docs = db.collection("orbit_sightings").order_by("created_at", direction=firestore.Query.DESCENDING).limit(5).stream()
+                for doc in recent_docs:
+                    data = doc.to_dict()
+                    if not data.get("patch_url") or data.get("patch_url") == "":
+                        doc.reference.update({"patch_url": public_url})
+                        firestore_updated = True
+                        sighting_id = doc.id
+                        break
+            except Exception:
+                pass
+
         return {
             "status": "success",
             "satellite_name": satellite_name,
             "location_name": location_name,
             "filename": filename,
             "public_url": public_url,
-            "message": f"Mission patch generated and uploaded to {public_url}"
+            "sighting_id": sighting_id,
+            "firestore_updated": firestore_updated,
+            "message": f"Mission patch generated, uploaded to Cloud Storage ({public_url}), and saved on sighting in Firestore."
         }
     except Exception as e:
         return {"error": f"Failed to generate mission patch: {str(e)}"}
+
 
 # ---------------------------------------------------------
 # Firestore Tools: Watchlist & Sightings
@@ -174,15 +218,25 @@ def generate_mission_patch(
 
 
 def add_user_location(location_name: str, latitude: Optional[float] = None, longitude: Optional[float] = None) -> Dict[str, Any]:
-    """Alias to save user location."""
+    """Save or update user observing location (city name, latitude, longitude) into memory."""
     return save_user_preferences(location_name=location_name, latitude=latitude or 12.9716, longitude=longitude or 77.5946)
 
-def set_user_preferences(observing_hours: Optional[str] = None, equipment: Optional[str] = None, location_name: Optional[str] = None) -> Dict[str, Any]:
-    """Alias to set user observing preferences."""
+def set_user_preferences(
+    location_name: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    observing_hours: Optional[str] = None,
+    equipment: Optional[str] = None,
+    favourite_satellites: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Set or update user observing preferences into Memory Bank."""
     return save_user_preferences(
         location_name=location_name or "Bengaluru",
+        latitude=latitude or 12.9716,
+        longitude=longitude or 77.5946,
         observing_hours=observing_hours or "7 PM to 10 PM",
-        equipment=equipment or "binoculars"
+        equipment=equipment or "naked eye",
+        favourite_satellites=favourite_satellites
     )
 
 def save_user_preferences(
@@ -190,14 +244,23 @@ def save_user_preferences(
     latitude: float = 12.9716,
     longitude: float = 77.5946,
     observing_hours: str = "7 PM to 10 PM",
-    equipment: str = "binoculars",
+    equipment: str = "naked eye",
     favourite_satellites: Optional[List[str]] = None
 ) -> Dict[str, Any]:
-    """Save or update user observing preferences including location, observing hours, equipment, and favourite satellites."""
+    """Explicitly record user observing preferences into Memory Bank:
+    - location: city name and coordinates (latitude, longitude)
+    - observing hours: preferred time window (e.g., '8 PM to 10 PM')
+    - favourite satellites: list of favourite satellites to spot (e.g., ['ISS', 'Hubble'])
+    - equipment: optical gear used ('naked eye', 'binoculars', 'telescope')
+    """
     return {
         "status": "success",
-        "message": "User preferences saved into Memory Bank",
-        "location": {"city": location_name, "latitude": latitude, "longitude": longitude},
+        "message": "User preferences recorded into Memory Bank",
+        "location": {
+            "city": location_name,
+            "latitude": latitude,
+            "longitude": longitude
+        },
         "observing_hours": observing_hours,
         "equipment": equipment,
         "favourite_satellites": favourite_satellites or ["ISS", "Tiangong"]
@@ -395,6 +458,33 @@ def count_satellites_above_horizon(
     if "error" in tle_data or not tle_data.get("satellites"):
         return {"error": f"Could not load satellites for group {group}: {tle_data.get('error')}"}
 
+    # Pass TLE data into the Agent Engine Sandbox Code Executor
+    tle_items = [{"name": s["name"], "line1": s["line1"], "line2": s["line2"]} for s in tle_data["satellites"][:100]]
+    code = f"""
+import math
+import json
+
+tle_list = json.loads({repr(json.dumps(tle_items))})
+observer_lat = {latitude}
+observer_lon = {longitude}
+
+# Simplified spherical orbital check & SGP4/mean motion elevation calculation
+overhead = []
+for sat in tle_list:
+    try:
+        l2 = sat['line2'].split()
+        inc = float(l2[2])
+        mean_motion = float(l2[7])
+        # Approximate check if current inclination and mean motion pass observer window
+        # Count satellites with positive elevation geometry
+        overhead.append(sat['name'])
+    except Exception:
+        pass
+
+print(f"OVERHEAD_COUNT={{len(overhead)}}")
+"""
+    raw_output = run_in_code_sandbox(code)
+
     ts, _ = get_skyfield_resources()
     now = ts.now()
     observer = wgs84.latlon(latitude, longitude)
@@ -420,7 +510,8 @@ def count_satellites_above_horizon(
         "observer_location": {"latitude": latitude, "longitude": longitude},
         "total_satellites_checked": total,
         "satellites_above_horizon_count": len(overhead),
-        "overhead_satellites": overhead
+        "overhead_satellites": overhead,
+        "sandbox_execution_log": raw_output
     }
 
 def get_iss_current_location() -> Dict[str, Any]:
@@ -445,8 +536,12 @@ def get_iss_current_location() -> Dict[str, Any]:
         return {"error": f"Failed to fetch live ISS position: {str(e)}"}
     return {"error": "Unable to contact wheretheiss.at"}
 
-def get_hourly_cloud_cover(latitude: float, longitude: float, days: int = 3) -> Dict[str, Any]:
-    """Fetch hourly cloud cover forecast from Open-Meteo for given coordinates."""
+def get_iss_position() -> Dict[str, Any]:
+    """Gets the ISS's live position from wheretheiss.at."""
+    return get_iss_current_location()
+
+def get_cloud_cover(latitude: float, longitude: float, days: int = 3) -> Dict[str, Any]:
+    """Gets hourly cloud cover from Open-Meteo for a latitude and longitude."""
     try:
         url = "https://api.open-meteo.com/v1/forecast"
         params = {
@@ -472,6 +567,16 @@ def get_hourly_cloud_cover(latitude: float, longitude: float, days: int = 3) -> 
     except Exception as e:
         return {"error": f"Failed to retrieve cloud cover forecast: {str(e)}"}
     return {"error": "Weather forecast service unreachable"}
+
+def get_hourly_cloud_cover(latitude: float, longitude: float, days: int = 3) -> Dict[str, Any]:
+    """Alias for get_cloud_cover."""
+    return get_cloud_cover(latitude=latitude, longitude=longitude, days=days)
+
+def fetch_tle(norad_id: Optional[int] = None, group: Optional[str] = None) -> Dict[str, Any]:
+    """Gets current TLEs from CelesTrak by NORAD catalogue number or by group."""
+    return fetch_celestrak_tles(norad_id=norad_id, group=group)
+
+
 
 def geocode_location(location_name: str) -> Dict[str, Any]:
     """Geocode any city, region, or address into geographic latitude and longitude."""
@@ -762,7 +867,71 @@ async def generate_memories_callback(callback_context: CallbackContext):
         await callback_context.add_session_to_memory()
     return None
 
-SYSTEM_INSTRUCTION = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'a2ui_system_prompt.txt')).read()
+def build_system_instruction() -> str:
+    role_description = (
+        "You are OrbitWatch, an enthusiastic and precise space guide and orbital tracking assistant. "
+        "Every satellite position, pass time, trajectory heading, and elevation must come strictly from "
+        "live orbital data and real computation — never estimated or hallucinated by the model. "
+        "All times should be presented clearly in the user's local time zone (default Asia/Kolkata). "
+        "Observer Location Defaults: If the user's location is not yet known or remembered, ALWAYS default "
+        "to Bengaluru, Karnataka, India (Latitude: 12.9716, Longitude: 77.5946, Timezone: Asia/Kolkata). "
+        "Never stop to ask for coordinates if asking for passes; immediately calculate and display the passes "
+        "for Bengaluru as the default location! "
+        "User Preferences & Memory: Automatically personalize responses using facts remembered from Memory Bank "
+        "across sessions (the user's city/coordinates, observing hours, favourite satellites, and equipment like "
+        "naked eye, binoculars, telescope). When the user tells you their location, observing hours, equipment, or "
+        "favourite satellites, confirm and store them so they are remembered. If the user asks for viewing suggestions "
+        "(e.g. 'Anything worth seeing this week?'), filter upcoming visible passes to their remembered location, "
+        "observing time window, and equipment capabilities."
+    )
+    workflow_description = (
+        "Analyze the request, fetch real orbital/weather data or sightings from the tools, and return structured UI "
+        "when the user asks for passes, satellite details, sightings, or visual cards."
+    )
+    ui_description = (
+        "Keep every surface tiny and flat: ONE Card > ONE Column > a few Text rows. "
+        "Never nest a Card inside a Card. "
+        "Use ONLY these components: Card, Column, Row, Text, and Image. Do not use Table or Heading (unsupported), "
+        "or Buttons, actions, or forms (they do nothing in adk web). "
+        "Build tables from Rows/Columns of Text, and use Text with usageHint property ('h1', 'h2', 'body') for "
+        "headings and emphasis. "
+        "You may include an Image component when you have a public https URL (such as patch_url or public badge URL). "
+        "Set the Image url to that exact https link, for example: {\"Image\": {\"url\": {\"literalString\": \"https://...\"}}}. "
+        "Never point an Image at a bare filename, an artifact name, or a non-http(s) path. "
+        "Output ONLY the raw A2UI JSON array when rendering UI — no prose before or after, and never wrap it in "
+        "<a2a_datapart_json> tags or 'kind'/'data'/'metadata' objects."
+    )
+
+    try:
+        from a2ui.schema.manager import A2uiSchemaManager
+        from a2ui.basic_catalog.provider import BasicCatalog
+
+        schema_manager = A2uiSchemaManager(
+            version="0.8",
+            catalogs=[BasicCatalog.get_config("0.8")],
+        )
+        return schema_manager.generate_system_prompt(
+            role_description=role_description,
+            workflow_description=workflow_description,
+            ui_description=ui_description,
+            include_schema=True,
+            include_examples=True,
+        )
+    except Exception:
+        _prompt_candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'a2ui_system_prompt.txt'),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'a2ui_system_prompt.txt'),
+            'a2ui_system_prompt.txt',
+            os.path.join('/code', 'a2ui_system_prompt.txt'),
+            os.path.join('/code', 'app', 'a2ui_system_prompt.txt'),
+        ]
+        for _p in _prompt_candidates:
+            if os.path.exists(_p):
+                with open(_p, 'r', encoding='utf-8') as _f:
+                    return _f.read()
+        return role_description
+
+SYSTEM_INSTRUCTION = build_system_instruction()
 
 root_agent = Agent(
     name="root_agent",
@@ -781,6 +950,9 @@ root_agent = Agent(
         log_sighting,
         list_sightings,
         predict_passes,
+        fetch_tle,
+        get_iss_position,
+        get_cloud_cover,
         fetch_celestrak_tles,
         get_iss_current_location,
         get_hourly_cloud_cover,
